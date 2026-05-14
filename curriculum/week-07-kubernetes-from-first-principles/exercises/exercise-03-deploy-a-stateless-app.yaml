@@ -1,0 +1,401 @@
+# Exercise 3 — Deploy a Stateless App: One Manifest, Annotated Line by Line
+#
+# A single YAML file with four resources (Namespace, ConfigMap, Secret, Deployment, Service).
+# Every line is annotated; comments are the walkthrough. Read top to bottom.
+#
+# Apply this file with:
+#     kubectl apply -f exercise-03-deploy-a-stateless-app.yaml
+# Verify with:
+#     kubectl -n ex03 get all,configmap,secret
+# Visit the app with:
+#     kubectl -n ex03 port-forward svc/hello 8080:80
+#     # then browse http://localhost:8080/
+# Tear down with:
+#     kubectl delete -f exercise-03-deploy-a-stateless-app.yaml
+#
+# Estimated time: 60 minutes (30 min reading, 20 min applying and inspecting, 10 min writing up).
+# Cost: $0.00 (entirely local on the kind cluster from Exercises 1 and 2).
+#
+# This manifest must pass `kubectl apply --dry-run=client -f` and `kubectl apply --dry-run=server -f`
+# without error. If you change anything, re-run both before committing.
+#
+# ----------------------------------------------------------------------
+# Resource 1 — Namespace
+# ----------------------------------------------------------------------
+# A namespace is the cluster's soft tenancy boundary. Most of the cluster's resources are
+# namespaced; putting your week-07 work inside `ex03` keeps it from colliding with anything
+# in `default` (and lets you tear down the whole exercise with one `kubectl delete ns ex03`).
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ex03
+  labels:
+    # The label is informational here; nothing selects on it. We add it as a habit
+    # because future tooling (network policies, RBAC) may want to select namespaces by label.
+    course: c15
+    week: w07
+    exercise: ex03
+
+# ----------------------------------------------------------------------
+# Resource 2 — ConfigMap
+# ----------------------------------------------------------------------
+# Configuration injection. The ConfigMap holds non-secret key-value strings. The pod will
+# consume the whole ConfigMap as environment variables via `envFrom.configMapRef`.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: hello-config
+  namespace: ex03
+  labels:
+    # All four resources share `app: hello` so that selectors on it return the workload.
+    # This is the convention from Lecture 3 Section 13.
+    app: hello
+data:
+  # Each key becomes an environment variable in the pod (because we use envFrom below).
+  # Values must be strings. Multi-line values are valid; we keep it simple here.
+  LOG_LEVEL: "info"
+  GREETING: "Welcome to C15 Week 7 — Kubernetes from First Principles"
+  PORT: "8080"
+  # Note: PORT is also referenced directly in the container's `containerPort` and the
+  # readiness probe. We keep them in sync by setting PORT here and using $(PORT) in the
+  # container's command. (The $(PORT) syntax is Kubernetes's own variable expansion;
+  # it works in `command`, `args`, and `env.value` fields.)
+
+# ----------------------------------------------------------------------
+# Resource 3 — Secret
+# ----------------------------------------------------------------------
+# Secret injection. Same shape as a ConfigMap, with two differences:
+#   1) values are base64-encoded on the wire (we use stringData so we can write plaintext)
+#   2) the resource type signals to operators that this is sensitive
+#
+# IMPORTANT: this Secret contains a FAKE value. Never commit real secrets to a manifest
+# checked into git. In real deployments you would use Sealed Secrets, SOPS, or the
+# External Secrets Operator (see Week 6 homework Problem 6).
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: hello-secret
+  namespace: ex03
+  labels:
+    app: hello
+type: Opaque
+stringData:
+  # We never use this value; it exists to demonstrate the envFrom-secretRef pattern.
+  # Rotate before any real use.
+  API_KEY: "fake-api-key-rotate-before-prod"
+  DATABASE_URL: "postgres://fake:fake@db.ex03.svc.cluster.local:5432/hello"
+
+# ----------------------------------------------------------------------
+# Resource 4 — Deployment
+# ----------------------------------------------------------------------
+# The workload. A Deployment manages a ReplicaSet, which manages Pods. You write the
+# Deployment; the cluster creates the ReplicaSet and the Pods.
+#
+# We use the public nginxinc/nginx-unprivileged image so the pod can run as a non-root
+# user. The standard `nginx:latest` image listens on port 80, which requires root or a
+# capability the container does not have by default; `nginx-unprivileged` listens on 8080
+# and runs as UID 101.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hello
+  namespace: ex03
+  labels:
+    app: hello
+spec:
+  # Three replicas is the smallest count that lets you observe a rolling update without
+  # losing availability (maxSurge: 1, maxUnavailable: 0 guarantees >= 3 ready at all times).
+  replicas: 3
+
+  # The rolling update strategy. The fields below are the defaults; we set them explicitly
+  # so the YAML is self-documenting.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # maxSurge: 1 = during the roll, up to 1 extra pod above the desired replica count
+      # (so we peak at 4 pods, briefly, while rolling).
+      maxSurge: 1
+      # maxUnavailable: 0 = we never have fewer than `replicas` ready pods. This is the
+      # right choice for any user-facing service. For batch jobs you might allow some
+      # unavailability to speed up the roll.
+      maxUnavailable: 0
+
+  # The selector determines which pods this Deployment "owns." It MUST match the labels
+  # in `template.metadata.labels`. The selector is immutable after creation; pick it
+  # carefully and keep it minimal (one label is usually enough).
+  selector:
+    matchLabels:
+      app: hello
+
+  template:
+    # The pod template. The Deployment's ReplicaSet will create pods from this template;
+    # each pod inherits the labels declared here. The `app: hello` label here is what the
+    # selector above matches, and what the Service (below) will also match.
+    metadata:
+      labels:
+        app: hello
+        # version: v1 would be added here for canary deploys; we don't use it in ex-03.
+
+    spec:
+      # The container runs as a non-root user. (The image we use is the unprivileged
+      # variant of nginx; this just makes the constraint explicit.)
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 101
+        fsGroup: 101
+
+      containers:
+        - name: hello
+          # Pin to a specific image tag (not `:latest`). The tag is content-addressed
+          # by nginxinc; rebuilds with the same tag will hash differently and the cluster
+          # will pull when imagePullPolicy=IfNotPresent (the default for non-:latest tags).
+          image: nginxinc/nginx-unprivileged:1.27-alpine
+          imagePullPolicy: IfNotPresent
+
+          ports:
+            - name: http
+              # The port the container listens on, inside the pod's network namespace.
+              # Naming the port (`name: http`) lets the Service and probes refer to it
+              # by name instead of by number; if we ever change the port, we change it
+              # in one place.
+              containerPort: 8080
+              protocol: TCP
+
+          # Inject the ConfigMap and Secret as environment variables. Every key in each
+          # resource becomes an env var with the same name.
+          envFrom:
+            - configMapRef:
+                name: hello-config
+            - secretRef:
+                name: hello-secret
+
+          # Resource requests are SCHEDULING input: the scheduler uses them to pick a
+          # node with enough capacity. Limits are EVICTION input: a container that
+          # exceeds memory limits is OOM-killed; a container that exceeds CPU limits is
+          # throttled.
+          resources:
+            requests:
+              cpu: "100m"           # 0.1 CPU core
+              memory: "64Mi"        # 64 MiB
+            limits:
+              cpu: "500m"           # 0.5 CPU core
+              memory: "128Mi"       # 128 MiB
+
+          # Readiness probe: "should this pod receive traffic?". If this fails, the pod
+          # is REMOVED FROM THE SERVICE's endpoint list. The pod is still alive; it just
+          # is not in the load-balancing pool. This is the probe you tune for slow startup
+          # and for "the app is overloaded; don't send me more for a moment."
+          readinessProbe:
+            httpGet:
+              path: /
+              # Reference the port by name (matches `ports[0].name: http` above).
+              port: http
+            # Wait this long before the first probe runs. Default is 0, which is rarely
+            # what you want; almost every app needs at least a few seconds of warm-up.
+            initialDelaySeconds: 2
+            # Probe every N seconds.
+            periodSeconds: 3
+            # Fail the probe if the HTTP call does not respond within this many seconds.
+            timeoutSeconds: 1
+            # Mark the pod as ready after this many consecutive successes (default 1).
+            successThreshold: 1
+            # Mark the pod as not-ready after this many consecutive failures (default 3).
+            failureThreshold: 3
+
+          # Liveness probe: "is this pod still alive at all?". If this fails, the
+          # CONTAINER is RESTARTED. This is a stronger action than readiness; tune it
+          # conservatively (longer timeouts, higher failure thresholds) so that a brief
+          # overload does not cause a restart cascade.
+          livenessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 2
+            successThreshold: 1
+            # 3 consecutive failures, 10 seconds apart, before restart. That's 30 seconds
+            # of "the app is unresponsive" before the cluster kills it. Adjust to taste.
+            failureThreshold: 3
+
+# ----------------------------------------------------------------------
+# Resource 5 — Service
+# ----------------------------------------------------------------------
+# The stable virtual IP. The Service selects pods by label (the same `app: hello` label
+# the Deployment puts on its pods) and exposes them on a cluster-internal IP.
+#
+# `type: ClusterIP` is reachable from inside the cluster only. To reach this Service from
+# your laptop, you `kubectl port-forward` to it. To reach it from outside the cluster
+# without port-forward, you would use `type: NodePort`, `type: LoadBalancer`, or an Ingress
+# — all of which we will see in Week 8.
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: hello
+  namespace: ex03
+  labels:
+    app: hello
+spec:
+  type: ClusterIP
+  selector:
+    # The selector matches pods with `app: hello` in this namespace. Crucially, this is
+    # decoupled from the Deployment — the Service does not "know" about the Deployment;
+    # it only knows about the pods' labels.
+    app: hello
+  ports:
+    - name: http
+      # The port the Service is reachable on (inside the cluster).
+      port: 80
+      # The port on the pod to forward to. We use the named port (matches the container's
+      # `ports[0].name: http`), so the Service config does not break if we change the
+      # container's port number.
+      targetPort: http
+      protocol: TCP
+
+# ----------------------------------------------------------------------
+# THE WALKTHROUGH
+# ----------------------------------------------------------------------
+#
+# 1. Apply:
+#        kubectl apply -f exercise-03-deploy-a-stateless-app.yaml
+#    Expected output:
+#        namespace/ex03 created
+#        configmap/hello-config created
+#        secret/hello-secret created
+#        deployment.apps/hello created
+#        service/hello created
+#
+# 2. Watch the pods come up:
+#        kubectl -n ex03 get pods -w
+#    You should see three pods transition from Pending -> ContainerCreating -> Running.
+#    The third column (READY) is `0/1` until the readiness probe passes, then `1/1`.
+#    Stop the watch with Ctrl-C when all three are 1/1.
+#
+# 3. List what was created:
+#        kubectl -n ex03 get all
+#    You will see:
+#        - the Service (`hello`) with a CLUSTER-IP
+#        - the Deployment (`hello`) with READY=3/3
+#        - the ReplicaSet (`hello-<hash>`) with DESIRED=CURRENT=READY=3
+#        - three Pods (`hello-<hash>-xxx`)
+#    The ReplicaSet was created by the Deployment controller; you did not write it.
+#
+# 4. Inspect the Endpoints (the list of pod IPs behind the Service):
+#        kubectl -n ex03 get endpointslice -l kubernetes.io/service-name=hello -o yaml
+#    You should see three `endpoints` entries with ready: true, one per pod.
+#
+# 5. Verify the env vars are injected:
+#        kubectl -n ex03 exec deploy/hello -- env | grep -E '^(LOG_LEVEL|GREETING|API_KEY|DATABASE_URL)'
+#    All four should be present. The Secret values are base64-encoded in etcd but
+#    decoded when injected into the container.
+#
+# 6. Visit the app:
+#        kubectl -n ex03 port-forward svc/hello 8080:80
+#        # in another terminal:
+#        curl http://localhost:8080/
+#    You should see the nginx welcome page.
+#
+# 7. Force a rolling update:
+#        kubectl -n ex03 set image deployment/hello hello=nginxinc/nginx-unprivileged:1.28-alpine
+#        kubectl -n ex03 rollout status deployment/hello
+#    Watch `kubectl -n ex03 get pods -w` in another terminal; you should see one new
+#    pod come up at a time while one old pod is terminated, three iterations.
+#    Total roll time: about 30 seconds.
+#
+# 8. Roll back:
+#        kubectl -n ex03 rollout undo deployment/hello
+#        kubectl -n ex03 rollout history deployment/hello
+#    The rollback uses the same algorithm in reverse.
+#
+# 9. Drift the cluster and watch it self-heal:
+#        kubectl -n ex03 delete pod -l app=hello --grace-period=0 --force
+#    All three pods are deleted. The ReplicaSet controller's next loop notices that
+#    `actual replicas < desired replicas` and creates three new pods. They come up in
+#    about 5 seconds. You did not write code to make this happen.
+#
+# 10. Tear down:
+#         kubectl delete -f exercise-03-deploy-a-stateless-app.yaml
+#     The namespace deletion cascades: the ConfigMap, Secret, Deployment, ReplicaSet,
+#     Pods, and Service are all garbage-collected. Verify:
+#         kubectl get namespace ex03
+#         # Error from server (NotFound): namespaces "ex03" not found
+#
+# ----------------------------------------------------------------------
+# WRITE-UP
+# ----------------------------------------------------------------------
+#
+# Create notes.md in ~/c15/week-07/ex-03-deploy/ and answer:
+#
+# 1. The `selector` in the Service and the `selector.matchLabels` in the Deployment
+#    both contain `app: hello`. What happens if you change the Deployment's selector
+#    but not the Service's? What happens the other way around?
+#
+# 2. The readiness probe and the liveness probe both call HTTP GET / on port `http`.
+#    Why does the project distinguish them, given they call the same endpoint? What
+#    is the operational difference between a readiness failure and a liveness failure?
+#
+# 3. When you ran `kubectl set image` in Step 7, which controller(s) did the work?
+#    Trace the chain from your `kubectl` invocation to the new pod being Running.
+#
+# 4. In Step 9, you deleted all three pods. Three new ones appeared. Name the
+#    controller that created the new ones, and the level-triggered property of the
+#    reconciliation loop that made this work without any per-event handling.
+#
+# 5. The Secret has values like "fake-api-key-rotate-before-prod". In a real deploy,
+#    where would the real values come from? Name two acceptable sources and one
+#    unacceptable source.
+#
+# ----------------------------------------------------------------------
+# ACCEPTANCE
+# ----------------------------------------------------------------------
+#
+# - [ ] `kubectl apply --dry-run=client -f exercise-03-deploy-a-stateless-app.yaml` exits 0.
+# - [ ] `kubectl apply --dry-run=server -f exercise-03-deploy-a-stateless-app.yaml` exits 0.
+# - [ ] `kubectl -n ex03 get pods` shows 3 pods with READY=1/1, STATUS=Running.
+# - [ ] `kubectl -n ex03 get endpointslice` shows 3 endpoints with ready: true.
+# - [ ] You completed the 10-step walkthrough and observed the expected output at each step.
+# - [ ] `notes.md` answers the five write-up questions.
+#
+# ----------------------------------------------------------------------
+# COMMON ERRORS
+# ----------------------------------------------------------------------
+#
+# - "Pod has unbound immediate PersistentVolumeClaims" — you added a PVC but kind has
+#   no storage class beyond local-path. Not relevant to this exercise; we use no PVCs.
+#
+# - "0/1 nodes are available: 1 node(s) had untolerated taint" — the control-plane
+#   node has a taint that prevents general workloads. In kind, this taint is removed
+#   for single-node clusters by default. If you see it, either run on a kind cluster
+#   with a worker node, or add a toleration to the pod spec.
+#
+# - "ImagePullBackOff" — the image tag does not exist. Verify the tag at
+#   https://hub.docker.com/r/nginxinc/nginx-unprivileged/tags. We tested 1.27-alpine
+#   in May 2026.
+#
+# - "Readiness probe failed: HTTP probe failed with statuscode: 403" — the nginx
+#   config is rejecting the probe. Check the container's logs (kubectl logs); the
+#   default nginx config returns 200 OK on `/`.
+#
+# - "selector does not match template labels" — you changed `selector.matchLabels`
+#   without changing `template.metadata.labels` (or vice versa). The API server
+#   rejects this since 1.16. Keep them in sync.
+#
+# ----------------------------------------------------------------------
+# NEXT STEPS
+# ----------------------------------------------------------------------
+#
+# The mini-project this week (`../mini-project/README.md`) extends this manifest into
+# a three-tier app: nginx as a reverse proxy in front of a Python API, both wired to
+# a Postgres backend. The shape of each tier is exactly what you wrote here — a
+# Deployment plus a Service plus a ConfigMap (and a Secret for the database URL).
+# Three copies of the same pattern.
+#
+# Once you can write this manifest from scratch without copying it, you have the
+# Kubernetes basics. Everything else in this curriculum is composition.
+#
+# If you find errors in this material, please open an issue or send a PR.
