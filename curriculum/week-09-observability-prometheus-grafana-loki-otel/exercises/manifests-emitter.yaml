@@ -1,0 +1,148 @@
+# Manifests for Exercise 2 - metric-emitter Deployment + Service,
+# its ServiceMonitor, its PrometheusRule, and the alert-webhook receiver.
+# Apply with: kubectl apply -f manifests-emitter.yaml
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: metric-emitter
+  namespace: default
+  labels:
+    app.kubernetes.io/name: metric-emitter
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: metric-emitter
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: metric-emitter
+    spec:
+      containers:
+        - name: emitter
+          image: metric-emitter:0.1
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: 25m
+              memory: 32Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: metric-emitter
+  namespace: default
+  labels:
+    app.kubernetes.io/name: metric-emitter
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: metric-emitter
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+      protocol: TCP
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: metric-emitter
+  namespace: monitoring
+  labels:
+    release: kps
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: metric-emitter
+  namespaceSelector:
+    matchNames:
+      - default
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 15s
+      scrapeTimeout: 10s
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: metric-emitter-rules
+  namespace: monitoring
+  labels:
+    release: kps
+spec:
+  groups:
+    - name: emitter-recording
+      interval: 30s
+      rules:
+        - record: emitter:requests_per_second
+          expr: |
+            sum (rate(emitter_requests_total[1m]))
+    - name: emitter-alerting
+      interval: 30s
+      rules:
+        - alert: EmitterRateLow
+          expr: emitter:requests_per_second < 5
+          for: 2m
+          labels:
+            severity: warning
+            service: metric-emitter
+          annotations:
+            summary: "metric-emitter request rate dropped below 5 req/s for 2 minutes"
+            description: "Current rate is {{ $value | humanize }} req/s. Expected at least 5."
+            runbook: "https://wiki.example.com/runbooks/emitter-rate-low"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: alert-webhook
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: alert-webhook
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: alert-webhook
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: alert-webhook
+    spec:
+      containers:
+        - name: webhook
+          image: alert-webhook:0.1
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 5001
+              protocol: TCP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: alert-webhook
+  namespace: monitoring
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: alert-webhook
+  ports:
+    - name: http
+      port: 5001
+      targetPort: http
