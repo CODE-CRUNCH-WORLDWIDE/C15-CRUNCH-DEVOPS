@@ -1,0 +1,393 @@
+# Exercise 4 - GKE Autopilot Dry-Run
+#
+# Time: 60 minutes (reading + understanding; no cluster required).
+# Cost: $0.00 (read-only walkthrough).
+#
+# This file is a single annotated YAML document plus a series of `gcloud`
+# commands you would run if you wanted to actually provision a GKE Autopilot
+# cluster and apply the same workload manifests you used in Exercises 1, 2,
+# and 3 to it.
+#
+# The point of the exercise is to make the portability claim concrete:
+# the workload manifests below are bit-for-bit identical to what you ran
+# on kind. The only things that differ between kind and Autopilot are:
+#   1) the cluster creation (gcloud command vs kind config)
+#   2) the NGINX Ingress Service type (LoadBalancer vs hostPort)
+#   3) the cert-manager ClusterIssuer (Let's Encrypt vs selfsigned)
+#
+# Everything else is unchanged. The Deployment, the Service, the Ingress,
+# the Certificate resource, the ArgoCD Application - all identical.
+#
+# YOU DO NOT NEED TO RUN THIS EXERCISE AGAINST A REAL CLUSTER. The exercise
+# is to read the commands, understand them, and write up a reflection. If
+# you choose to run against GKE Autopilot, the section at the end has the
+# full step-by-step.
+#
+# This manifest must pass `python3 -c "import yaml,sys; list(yaml.safe_load_all(open('exercise-04-gke-autopilot-dry-run.yaml')))"`
+# without error. If you edit anything, re-run the parse check.
+#
+# ======================================================================
+# Section 1 - The gcloud commands you would run
+# ======================================================================
+#
+# Step 1.1 - Enable the GKE API on your project (one-time per project):
+#
+#   gcloud services enable container.googleapis.com \
+#     --project=YOUR_PROJECT_ID
+#
+# Step 1.2 - Create the Autopilot cluster (about 90 seconds):
+#
+#   gcloud container clusters create-auto w08-autopilot \
+#     --region=us-central1 \
+#     --release-channel=regular \
+#     --labels=course=c15,week=w08
+#
+# Step 1.3 - Get cluster credentials into your local kubeconfig:
+#
+#   gcloud container clusters get-credentials w08-autopilot \
+#     --region=us-central1
+#
+# Step 1.4 - Verify:
+#
+#   kubectl get nodes
+#   # Empty in fresh Autopilot - nodes appear when pods schedule.
+#
+#   kubectl get namespaces
+#   # default, kube-system, kube-public, kube-node-lease, plus a few
+#   # GKE-managed namespaces (gmp-system for managed Prometheus, etc.)
+#
+# Step 1.5 - Install NGINX Ingress with Service type LoadBalancer:
+#
+#   helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
+#   helm repo update
+#   helm install ingress-nginx ingress-nginx/ingress-nginx \
+#     --namespace ingress-nginx \
+#     --create-namespace \
+#     --set controller.service.type=LoadBalancer
+#
+# Step 1.6 - Wait for the external IP:
+#
+#   kubectl -n ingress-nginx get svc ingress-nginx-controller -w
+#   # Watch the EXTERNAL-IP column. Initially <pending>; in about
+#   # 60-90 seconds Google provisions a Cloud Load Balancer and an IP.
+#   # Note the IP; you will point DNS at it.
+#
+# Step 1.7 - Install cert-manager:
+#
+#   helm repo add jetstack https://charts.jetstack.io
+#   helm repo update
+#   helm install cert-manager jetstack/cert-manager \
+#     --namespace cert-manager \
+#     --create-namespace \
+#     --version v1.15.0 \
+#     --set installCRDs=true
+#
+# Step 1.8 - Apply the ClusterIssuer (the Let's Encrypt staging version
+#            from the manifests below). Then apply the Application
+#            manifests below.
+#
+# Step 1.9 - Tear down when done:
+#
+#   gcloud container clusters delete w08-autopilot \
+#     --region=us-central1 \
+#     --quiet
+#
+# Autopilot's control plane is free for one zonal cluster, but the
+# pod-vCPU-seconds you accumulate while testing add up. Tear down on
+# Sunday.
+#
+# ======================================================================
+# Section 2 - The ClusterIssuer (Let's Encrypt staging)
+# ======================================================================
+#
+# Unlike kind, GKE Autopilot is reachable from the public Internet.
+# Let's Encrypt can complete the HTTP-01 challenge against your Ingress,
+# so the real ClusterIssuer works. We use staging here to avoid hitting
+# Let's Encrypt's production rate limits during testing; switch to
+# production by replacing the ACME server URL.
+#
+# Replace ops@YOUR_DOMAIN.com with a real email you control.
+---
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-staging
+spec:
+  acme:
+    server: https://acme-staging-v02.api.letsencrypt.org/directory
+    email: ops@YOUR_DOMAIN.com
+    privateKeySecretRef:
+      name: letsencrypt-staging-account
+    solvers:
+      - http01:
+          ingress:
+            ingressClassName: nginx
+---
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-prod
+spec:
+  acme:
+    server: https://acme-v02.api.letsencrypt.org/directory
+    email: ops@YOUR_DOMAIN.com
+    privateKeySecretRef:
+      name: letsencrypt-prod-account
+    solvers:
+      - http01:
+          ingress:
+            ingressClassName: nginx
+
+# ======================================================================
+# Section 3 - The application: identical to Exercise 1 and 2
+# ======================================================================
+#
+# Compare these resources line-by-line to what you applied in Exercises
+# 1 and 2 against kind. They are identical except for the namespace name
+# (ex04 vs ex01) and the host in the Ingress (app.YOUR_DOMAIN.com vs
+# app.localhost). The Deployment, the Service, the Ingress shape are
+# unchanged. This is the portability claim.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ex04
+  labels:
+    week: w08
+    exercise: ex04
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hello
+  namespace: ex04
+  labels:
+    app: hello
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: hello
+  template:
+    metadata:
+      labels:
+        app: hello
+    spec:
+      containers:
+        - name: hello
+          image: nginxinc/nginx-unprivileged:1.27-alpine
+          ports:
+            - containerPort: 8080
+          resources:
+            # Autopilot's minimum resource requests apply if these are
+            # smaller than the Autopilot minimum (currently 250m CPU and
+            # 512Mi memory per pod). Autopilot will bump us up to its
+            # minimum and bill us for the minimum. The same pod on kind
+            # would run with these smaller requests as-is.
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              memory: "256Mi"
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 8080
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 30
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: hello
+  namespace: ex04
+spec:
+  selector:
+    app: hello
+  ports:
+    - port: 80
+      targetPort: 8080
+  # Note: type defaults to ClusterIP. On Autopilot, we expose externally
+  # via the Ingress (which sits behind a LoadBalancer-type Service in
+  # the ingress-nginx namespace). We do NOT change this Service to
+  # LoadBalancer - that would provision a separate Google Cloud LB per
+  # app, which is the cost-pathology pattern Lecture 3 warned against.
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: hello
+  namespace: ex04
+  annotations:
+    # cert-manager will see this annotation and auto-create a
+    # Certificate resource that asks letsencrypt-staging to issue a
+    # cert for the hosts in the .spec.tls block. The Secret named in
+    # .spec.tls.secretName is where cert-manager stores the result.
+    cert-manager.io/cluster-issuer: letsencrypt-staging
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - app.YOUR_DOMAIN.com
+      secretName: app-tls
+  rules:
+    - host: app.YOUR_DOMAIN.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: hello
+                port:
+                  number: 80
+---
+# A PodDisruptionBudget. Autopilot rotates nodes aggressively (it
+# bin-packs and consolidates whenever traffic allows). Without a PDB,
+# both of our two replicas could be drained at once during a
+# consolidation, briefly leaving us with zero pods. minAvailable=1
+# ensures at least one pod is always serving traffic.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: hello-pdb
+  namespace: ex04
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: hello
+
+# ======================================================================
+# Section 4 - The ArgoCD Application
+# ======================================================================
+#
+# Once you have ArgoCD installed on the Autopilot cluster (the install
+# step is identical to Exercise 3 - kubectl apply the install.yaml),
+# this Application points it at a Git repo containing the manifests
+# above. Auto-sync, prune, selfHeal all as configured.
+#
+# In a real setup the manifests above would be in a Git repo of your
+# own (the homework problem walks through forking the example repo);
+# the path below would point at that fork.
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: hello-autopilot
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/YOUR_GITHUB_USERNAME/c15-week08-mini-project.git
+    targetRevision: main
+    path: manifests/autopilot
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: ex04
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+
+# ======================================================================
+# Section 5 - DNS (external-dns or manual)
+# ======================================================================
+#
+# For the Let's Encrypt HTTP-01 challenge to succeed, the hostname
+# `app.YOUR_DOMAIN.com` must resolve to the EXTERNAL-IP of the
+# ingress-nginx Service (from Step 1.6 in Section 1). You have two
+# options:
+#
+# Option A - manual DNS. Go to your DNS provider (Cloudflare, Route 53,
+#   Google Cloud DNS, etc.) and create an A record:
+#     app.YOUR_DOMAIN.com  ->  <the external IP>
+#   Wait ~60 seconds for propagation. Verify with `dig app.YOUR_DOMAIN.com`.
+#
+# Option B - external-dns. Install external-dns with the provider plugin
+#   for your DNS service, give it credentials, and it will create the A
+#   record automatically when this Ingress is applied. The Helm install
+#   command for Cloudflare (as an example) is in resources.md. Homework
+#   Problem 4 walks through external-dns specifically.
+#
+# Once DNS resolves, cert-manager's HTTP-01 challenge will succeed
+# (typically within 30 seconds) and the Certificate will move to
+# Ready=True. The Ingress will then serve HTTPS using the Let's Encrypt
+# staging cert. The cert is not browser-trusted (because it is staging),
+# but the issuance flow worked. Switch to letsencrypt-prod by editing
+# the Ingress annotation and re-applying.
+#
+# ======================================================================
+# Section 6 - Workload Identity (optional, advanced)
+# ======================================================================
+#
+# If your application needs to call a Google API - say, read from Cloud
+# Storage or write to BigQuery - you would set up Workload Identity for
+# its ServiceAccount. The recipe from Lecture 2:
+#
+#   1. Create a GCP service account:
+#        gcloud iam service-accounts create app-gsa
+#
+#   2. Grant the GSA permission on the resource:
+#        gsutil iam ch \
+#          serviceAccount:app-gsa@PROJECT.iam.gserviceaccount.com:objectViewer \
+#          gs://YOUR_BUCKET
+#
+#   3. Bind the KSA to the GSA:
+#        gcloud iam service-accounts add-iam-policy-binding \
+#          app-gsa@PROJECT.iam.gserviceaccount.com \
+#          --role=roles/iam.workloadIdentityUser \
+#          --member=serviceAccount:PROJECT.svc.id.goog[ex04/app-sa]
+#
+#   4. Create the KSA and annotate it:
+#        kubectl -n ex04 create serviceaccount app-sa
+#        kubectl -n ex04 annotate serviceaccount app-sa \
+#          iam.gke.io/gcp-service-account=app-gsa@PROJECT.iam.gserviceaccount.com
+#
+#   5. Reference the KSA in the Deployment's spec.serviceAccountName:
+#        spec:
+#          template:
+#            spec:
+#              serviceAccountName: app-sa
+#              containers: ...
+#
+# The example Deployment above does not use Workload Identity because
+# the nginx-unprivileged image does not call Google APIs. The mini-project
+# does not require Workload Identity either. Homework Problem 5 walks
+# through a Workload-Identity-flavored variant if you want to try it.
+#
+# ======================================================================
+# Section 7 - What to write up
+# ======================================================================
+#
+# Even if you do not provision the cluster, the exercise produces a
+# write-up. Create `exercises/notes-ex04.md` with:
+#
+#   1. A one-paragraph summary of what would change if you took the
+#      Exercise 1 / 2 / 3 manifests and ran them on GKE Autopilot vs
+#      kind. Be specific about the three differences (Section 3 of
+#      Lecture 3).
+#
+#   2. A one-paragraph summary of the cost of running this exercise
+#      end-to-end on a real Autopilot cluster for an hour, in dollars.
+#      Use the GKE pricing page (linked in resources.md) to compute.
+#
+#   3. A reflection: in the Workload Identity setup above, the
+#      `serviceAccount:PROJECT.svc.id.goog[ex04/app-sa]` principal
+#      string identifies the KSA precisely. Why is the namespace
+#      important? What would break if the binding were granted to
+#      `[*/app-sa]` (every namespace's app-sa)?
+#
+#   4. One question you still have about GKE Autopilot.
+#
+# ======================================================================
+# End of Exercise 4
+# ======================================================================
