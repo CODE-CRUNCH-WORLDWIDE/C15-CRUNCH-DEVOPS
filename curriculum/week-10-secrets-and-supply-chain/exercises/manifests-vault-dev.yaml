@@ -1,0 +1,101 @@
+# Vault in dev mode for Week 10 Exercise 1.
+#
+# Dev mode auto-unseals on startup with a known root token. This is *only*
+# suitable for local exercises; production uses HA mode with raft storage
+# and a real seal mechanism. See the official Helm chart for the prod path:
+# https://github.com/hashicorp/vault-helm
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: vault
+  labels:
+    purpose: w10-secrets-exercise
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: vault
+  namespace: vault
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: vault-token-review
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:auth-delegator
+subjects:
+  - kind: ServiceAccount
+    name: vault
+    namespace: vault
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: vault
+  namespace: vault
+spec:
+  serviceName: vault
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vault
+  template:
+    metadata:
+      labels:
+        app: vault
+    spec:
+      serviceAccountName: vault
+      containers:
+        - name: vault
+          image: hashicorp/vault:1.18.1
+          imagePullPolicy: IfNotPresent
+          args:
+            - "server"
+            - "-dev"
+            - "-dev-listen-address=0.0.0.0:8200"
+          env:
+            - name: VAULT_DEV_ROOT_TOKEN_ID
+              value: "root"
+            - name: VAULT_ADDR
+              value: "http://127.0.0.1:8200"
+            - name: VAULT_API_ADDR
+              value: "http://0.0.0.0:8200"
+          ports:
+            - name: http
+              containerPort: 8200
+              protocol: TCP
+          securityContext:
+            capabilities:
+              add: ["IPC_LOCK"]
+          readinessProbe:
+            httpGet:
+              path: /v1/sys/health
+              port: 8200
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vault
+  namespace: vault
+spec:
+  type: NodePort
+  selector:
+    app: vault
+  ports:
+    - name: http
+      port: 8200
+      targetPort: 8200
+      nodePort: 30200
+      protocol: TCP

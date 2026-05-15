@@ -1,0 +1,17 @@
+# kind cluster config for Week 10.
+# One control-plane node, two workers. Port 8200 forwarded so we can reach
+# Vault from the host without an additional port-forward in the happy path.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: w10
+nodes:
+  - role: control-plane
+    extraPortMappings:
+      - containerPort: 30200
+        hostPort: 8200
+        protocol: TCP
+      - containerPort: 30080
+        hostPort: 8080
+        protocol: TCP
+  - role: worker
+  - role: worker

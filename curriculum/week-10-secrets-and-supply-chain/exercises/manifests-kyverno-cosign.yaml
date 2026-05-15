@@ -1,0 +1,92 @@
+# Kyverno ClusterPolicy that requires every image in the `signed-only`
+# namespace to carry a valid cosign signature from a specific OIDC identity.
+#
+# Assumes:
+#   - Kyverno is installed: helm install kyverno kyverno/kyverno -n kyverno
+#     --create-namespace
+#   - The image was signed via the keyless flow against Fulcio + Rekor.
+#   - The expected signer identity matches the OIDC identity regex below.
+#
+# Reference: https://kyverno.io/docs/writing-policies/verify-images/sigstore/
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: signed-only
+  labels:
+    purpose: w10-cosign-enforcement
+    kyverno.io/verify-images: "required"
+---
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-cosign-signature
+spec:
+  validationFailureAction: Enforce
+  background: false
+  webhookTimeoutSeconds: 30
+  failurePolicy: Fail
+  rules:
+    - name: verify-images-in-signed-only-namespace
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+              namespaces:
+                - signed-only
+      verifyImages:
+        - imageReferences:
+            - "ghcr.io/*/*"
+            - "docker.io/*/*"
+            - "localhost:5001/*"
+          attestors:
+            - count: 1
+              entries:
+                - keyless:
+                    subject: "https://github.com/EXAMPLE-OWNER/EXAMPLE-REPO/.github/workflows/release.yaml@refs/heads/main"
+                    issuer: "https://token.actions.githubusercontent.com"
+                    rekor:
+                      url: "https://rekor.sigstore.dev"
+          mutateDigest: true
+          required: true
+          verifyDigest: true
+---
+# A second policy: require a signed SBOM attestation as well as the signature.
+# Stricter than the first; install only after you have shipped the attestation
+# step in the build pipeline.
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-sbom-attestation
+spec:
+  validationFailureAction: Audit
+  background: false
+  rules:
+    - name: verify-spdx-attestation
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+              namespaces:
+                - signed-only
+      verifyImages:
+        - imageReferences:
+            - "ghcr.io/*/*"
+            - "docker.io/*/*"
+          attestations:
+            - type: "https://spdx.dev/Document"
+              attestors:
+                - count: 1
+                  entries:
+                    - keyless:
+                        subject: "https://github.com/EXAMPLE-OWNER/EXAMPLE-REPO/.github/workflows/release.yaml@refs/heads/main"
+                        issuer: "https://token.actions.githubusercontent.com"
+                        rekor:
+                          url: "https://rekor.sigstore.dev"
+              conditions:
+                - all:
+                    - key: "{{ spdxVersion }}"
+                      operator: Equals
+                      value: "SPDX-2.3"
