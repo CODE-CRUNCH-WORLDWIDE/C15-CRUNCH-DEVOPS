@@ -1,0 +1,451 @@
+# kustomize/crunch-quotes/base/*.yaml — the application manifests.
+#
+# This file is the base Kustomize bundle for the capstone application.
+# Per-environment overlays (kind, civo, etc.) live under
+# kustomize/crunch-quotes/overlays/. The overlay supplies the image
+# tag, the ingress hostname, and the replica count; everything else
+# is in the base.
+#
+# Resources in this file:
+#   - Namespace (app)
+#   - ConfigMap  (application config — non-secret)
+#   - StatefulSet (postgres, 1 replica, PVC-backed)
+#   - Service (postgres)
+#   - Deployment (crunch-quotes, 2 replicas)
+#   - Service (crunch-quotes)
+#   - Ingress (crunch-quotes, TLS via cert-manager)
+#   - ServiceMonitor (crunch-quotes, Prometheus scrape)
+#   - HorizontalPodAutoscaler (crunch-quotes)
+#   - PodDisruptionBudget (crunch-quotes)
+#   - Certificate (crunch-quotes)
+#
+# All API versions are stable as of Kubernetes 1.31 (May 2026).
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: app
+  labels:
+    team: platform
+    cost-center: cc-1001
+    environment: production
+    owner: sre-platform
+    # The pod-security-standards labels enforce baseline at admission.
+    # Reference:
+    # https://kubernetes.io/docs/concepts/security/pod-security-standards/
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: crunch-quotes-config
+  namespace: app
+  labels:
+    app: crunch-quotes
+    team: platform
+    cost-center: cc-1001
+    environment: production
+    owner: sre-platform
+data:
+  # All non-secret configuration. Secrets come from Vault via the
+  # Vault Agent injector (see the Deployment annotations below).
+  APP_NAME: "crunch-quotes"
+  LOG_LEVEL: "INFO"
+  POSTGRES_HOST: "postgres.app.svc.cluster.local"
+  POSTGRES_PORT: "5432"
+  POSTGRES_DB: "quotes"
+  POSTGRES_USER: "quotes_app"
+  OTEL_SERVICE_NAME: "crunch-quotes"
+  OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector.monitoring.svc.cluster.local:4317"
+  OTEL_TRACES_EXPORTER: "otlp"
+  OTEL_METRICS_EXPORTER: "none"
+  OTEL_LOGS_EXPORTER: "none"
+  OTEL_RESOURCE_ATTRIBUTES: "service.name=crunch-quotes,deployment.environment=production"
+
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: app
+  labels:
+    app: postgres
+    team: platform
+    cost-center: cc-1001
+    environment: production
+    owner: sre-platform
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+        team: platform
+        cost-center: cc-1001
+        environment: production
+        owner: sre-platform
+    spec:
+      securityContext:
+        fsGroup: 999
+        runAsUser: 999
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: postgres
+          image: postgres:16.4-alpine
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: postgres
+              containerPort: 5432
+          env:
+            - name: POSTGRES_DB
+              value: "quotes"
+            - name: POSTGRES_USER
+              value: "quotes_app"
+            - name: POSTGRES_PASSWORD
+              # In the capstone-final state this is sourced from Vault.
+              # For the bootstrap, we use a Secret that SOPS encrypts
+              # in Git. Either path keeps plaintext out of Git.
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-creds
+                  key: password
+            - name: PGDATA
+              value: "/var/lib/postgresql/data/pgdata"
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+          readinessProbe:
+            exec:
+              command:
+                - pg_isready
+                - -U
+                - quotes_app
+                - -d
+                - quotes
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 3
+          livenessProbe:
+            exec:
+              command:
+                - pg_isready
+                - -U
+                - quotes_app
+                - -d
+                - quotes
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            timeoutSeconds: 5
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false
+            capabilities:
+              drop: ["ALL"]
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          team: platform
+          cost-center: cc-1001
+          environment: production
+          owner: sre-platform
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 1Gi
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: app
+  labels:
+    app: postgres
+spec:
+  type: ClusterIP
+  ports:
+    - port: 5432
+      targetPort: postgres
+      name: postgres
+  selector:
+    app: postgres
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: crunch-quotes
+  namespace: app
+  labels:
+    app: crunch-quotes
+    team: platform
+    cost-center: cc-1001
+    environment: production
+    owner: sre-platform
+spec:
+  replicas: 2
+  # Use rolling update with a small surge to keep traffic flowing.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: crunch-quotes
+  template:
+    metadata:
+      labels:
+        app: crunch-quotes
+        team: platform
+        cost-center: cc-1001
+        environment: production
+        owner: sre-platform
+      annotations:
+        # Vault Agent injector annotations. The agent runs as a
+        # sidecar and writes the secret to a shared volume; the
+        # application reads it from /vault/secrets/postgres.
+        # Reference:
+        # https://developer.hashicorp.com/vault/docs/platform/k8s/injector/annotations
+        vault.hashicorp.com/agent-inject: "true"
+        vault.hashicorp.com/role: "crunch-quotes"
+        vault.hashicorp.com/agent-inject-secret-postgres: "secret/data/crunch-quotes/postgres"
+        vault.hashicorp.com/agent-inject-template-postgres: |
+          {{- with secret "secret/data/crunch-quotes/postgres" -}}
+          POSTGRES_PASSWORD={{ .Data.data.password }}
+          {{- end }}
+        # Prometheus scrape annotations — alternative to ServiceMonitor;
+        # ServiceMonitor is preferred but the annotations are documented
+        # for completeness.
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: crunch-quotes
+      securityContext:
+        fsGroup: 65532
+        runAsUser: 65532
+        runAsGroup: 65532
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: app
+          # Image and tag are supplied by the kustomize overlay.
+          # The base manifest references a placeholder so the file
+          # parses; the overlay's `images:` patch sets the real value.
+          image: "ghcr.io/your-org/crunch-quotes:0.0.0-placeholder"
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8000
+          envFrom:
+            - configMapRef:
+                name: crunch-quotes-config
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          # The Vault Agent injector mounts /vault/secrets which
+          # contains POSTGRES_PASSWORD; the app sources it on start.
+          # We also have to map it into an env var; the app's
+          # entrypoint loads /vault/secrets/postgres into env.
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 2
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 15
+            timeoutSeconds: 3
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: crunch-quotes
+      terminationGracePeriodSeconds: 30
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: crunch-quotes
+  namespace: app
+  labels:
+    app: crunch-quotes
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: crunch-quotes
+  namespace: app
+  labels:
+    app: crunch-quotes
+    team: platform
+    cost-center: cc-1001
+    environment: production
+    owner: sre-platform
+spec:
+  type: ClusterIP
+  ports:
+    - port: 80
+      targetPort: http
+      name: http
+  selector:
+    app: crunch-quotes
+
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: crunch-quotes
+  namespace: app
+  labels:
+    app: crunch-quotes
+  annotations:
+    cert-manager.io/cluster-issuer: selfsigned-issuer
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - crunch-quotes.local
+      secretName: crunch-quotes-tls
+  rules:
+    - host: crunch-quotes.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: crunch-quotes
+                port:
+                  number: 80
+
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: crunch-quotes
+  namespace: app
+  labels:
+    app: crunch-quotes
+    release: kube-prometheus-stack  # required by Prometheus serviceMonitorSelector
+spec:
+  selector:
+    matchLabels:
+      app: crunch-quotes
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 30s
+      scrapeTimeout: 10s
+
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: crunch-quotes
+  namespace: app
+  labels:
+    app: crunch-quotes
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: crunch-quotes
+  minReplicas: 2
+  maxReplicas: 8
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 60
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 70
+  behavior:
+    # Cap the scale-up rate to prevent autoscaler runaway (W11 Lecture 2).
+    scaleUp:
+      stabilizationWindowSeconds: 30
+      policies:
+        - type: Pods
+          value: 2
+          periodSeconds: 60
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Percent
+          value: 50
+          periodSeconds: 60
+
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: crunch-quotes
+  namespace: app
+  labels:
+    app: crunch-quotes
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: crunch-quotes

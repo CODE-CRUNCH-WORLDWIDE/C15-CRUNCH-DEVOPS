@@ -1,0 +1,68 @@
+# gitops/app-of-apps.yaml — the root Application that recursively
+# applies every other Application under gitops/apps/.
+#
+# This is the only Application a human applies to the cluster
+# directly (via `kubectl apply` from the bootstrap script). Once it is
+# applied, ArgoCD reads the gitops/apps/ directory and applies every
+# child Application it finds.
+#
+# Reference:
+#   https://argo-cd.readthedocs.io/en/stable/operator-manual/cluster-bootstrapping/
+# API version: argoproj.io/v1alpha1 (the only version ArgoCD currently
+# uses for the Application CRD; stable since ArgoCD 2.x).
+
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: app-of-apps
+  namespace: argocd
+  # The finalizer ensures that when the Application is deleted, ArgoCD
+  # cleans up all child Applications too. Without it, child resources
+  # remain orphaned.
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+
+  source:
+    # Replace with your fork's URL when running the capstone.
+    repoURL: https://github.com/your-org/c15-capstone.git
+    targetRevision: main
+    path: gitops/apps
+    directory:
+      # Recurse into subdirectories. The structure under gitops/apps/ is:
+      #   gitops/apps/platform/        (ingress, cert-manager, etc.)
+      #   gitops/apps/policies/        (Kyverno policies)
+      #   gitops/apps/app/             (the application itself)
+      recurse: true
+      jsonnet: {}
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd
+
+  syncPolicy:
+    automated:
+      # prune: true means resources removed from Git are removed from
+      # the cluster on the next sync. The default is false (Git
+      # additions are applied, but removals are surfaced as OutOfSync
+      # without action). For a single-environment capstone, true is
+      # correct; for a multi-environment fleet, consider tiering.
+      prune: true
+      # selfHeal: true means cluster-side modifications are reverted
+      # on the next sync. The default is false (drift surfaces as
+      # OutOfSync). For a learning artifact, true is correct; for
+      # production, the team's policy applies.
+      selfHeal: true
+      allowEmpty: false
+    syncOptions:
+      - CreateNamespace=true
+      - ApplyOutOfSyncOnly=true
+      - PrunePropagationPolicy=foreground
+      - PruneLast=true
+    retry:
+      limit: 5
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 3m

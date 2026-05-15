@@ -1,0 +1,117 @@
+# gitops/apps/policies/*.yaml — Kyverno policies that govern the
+# cluster's admission decisions.
+#
+# Two policies in this file:
+#   1. verify-images:        every image in the `app` namespace must
+#                            carry a cosign signature from the team's
+#                            public key.
+#   2. require-cost-labels:  every Pod in the `app` namespace must
+#                            carry the four cost-allocation labels.
+#
+# Both policies are `enforce` mode — they refuse non-compliant
+# resources. The alternative is `audit` mode (log without refusing),
+# which a real cluster uses while rolling the policy out before
+# switching to enforce. The capstone is enforce-from-day-one.
+#
+# Reference:
+#   - Policy structure: https://kyverno.io/docs/writing-policies/
+#   - verifyImages:     https://kyverno.io/docs/writing-policies/verify-images/sigstore/
+#   - validate rules:   https://kyverno.io/docs/writing-policies/validate/
+# API version: kyverno.io/v1 (stable since Kyverno 1.6).
+
+---
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: verify-images
+  annotations:
+    policies.kyverno.io/title: "Verify image signatures (cosign)"
+    policies.kyverno.io/category: "Software Supply Chain Security"
+    policies.kyverno.io/severity: "high"
+    policies.kyverno.io/subject: "Pod, Deployment, StatefulSet, DaemonSet"
+    policies.kyverno.io/description: >-
+      Every container image deployed into the `app` namespace must
+      carry a valid cosign signature from the team's public key.
+      Images that are unsigned, or signed by an untrusted key, are
+      refused at admission.
+spec:
+  validationFailureAction: Enforce
+  background: false
+  webhookTimeoutSeconds: 30
+  failurePolicy: Fail
+  rules:
+    - name: verify-app-images
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+              namespaces:
+                - app
+      # Exclude the postgres image and the Vault sidecar — they are
+      # community images we do not sign. In a real cluster, you would
+      # either fork-and-sign them or use a Sigstore policy controller
+      # that trusts Sigstore's public-good infrastructure.
+      exclude:
+        any:
+          - resources:
+              selector:
+                matchLabels:
+                  app: postgres
+      verifyImages:
+        - imageReferences:
+            - "ghcr.io/your-org/crunch-quotes:*"
+            - "localhost:5001/crunch-quotes:*"
+          mutateDigest: true
+          verifyDigest: true
+          required: true
+          attestors:
+            - count: 1
+              entries:
+                - keys:
+                    publicKeys: |-
+                      -----BEGIN PUBLIC KEY-----
+                      PLACEHOLDER_REPLACE_WITH_TEAM_COSIGN_PUBLIC_KEY
+                      -----END PUBLIC KEY-----
+                    rekor:
+                      url: https://rekor.sigstore.dev
+
+---
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-cost-labels
+  annotations:
+    policies.kyverno.io/title: "Require FinOps cost-allocation labels"
+    policies.kyverno.io/category: "FinOps / Best Practices"
+    policies.kyverno.io/severity: "medium"
+    policies.kyverno.io/subject: "Pod"
+    policies.kyverno.io/description: >-
+      Every Pod in the `app` namespace must carry the four FinOps
+      cost-allocation labels: team, cost-center, environment, owner.
+      Pods missing any label are refused at admission. The labels
+      drive OpenCost's cost-allocation report (Week 11) and are the
+      single largest multiplier in cost visibility.
+spec:
+  validationFailureAction: Enforce
+  background: false
+  rules:
+    - name: validate-labels-pod
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+              namespaces:
+                - app
+      validate:
+        message: >-
+          Pods in `app` must have labels: team, cost-center,
+          environment, owner. See ADR-0004 for the rationale.
+        pattern:
+          metadata:
+            labels:
+              team: "?*"
+              cost-center: "?*"
+              environment: "?*"
+              owner: "?*"

@@ -1,0 +1,57 @@
+# kind cluster configuration for the Week 12 capstone.
+#
+# This is the local-path cluster: one control-plane + two workers, with
+# ingress exposed on the host ports 80 and 443 so that the capstone's
+# application is reachable at https://crunch-quotes.local (after adding
+# a /etc/hosts entry that points the name at 127.0.0.1).
+#
+# Reference: https://kind.sigs.k8s.io/docs/user/configuration/
+# API version stability: kind.x-k8s.io/v1alpha4 has been the stable API
+# version for kind cluster configuration since kind 0.11; current as of
+# kind 0.24 (May 2026).
+
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: capstone
+
+# Pin the Kubernetes node image. The digest is omitted on purpose for
+# the capstone — pin in production. Verify the image exists with:
+#   docker pull kindest/node:v1.31.0
+nodes:
+  - role: control-plane
+    # Expose host ports 80 and 443 on the control-plane node so that
+    # ingress-nginx (which we will install via Helm in Exercise 3) can
+    # serve external traffic without a LoadBalancer service.
+    kubeadmConfigPatches:
+      - |
+        kind: InitConfiguration
+        nodeRegistration:
+          kubeletExtraArgs:
+            node-labels: "ingress-ready=true"
+    extraPortMappings:
+      - containerPort: 80
+        hostPort: 80
+        protocol: TCP
+      - containerPort: 443
+        hostPort: 443
+        protocol: TCP
+  - role: worker
+  - role: worker
+
+# Enable a local container registry connection. The bootstrap script
+# (in mini-project/capstone/Makefile) creates a registry container on
+# the same Docker network and registers it with the cluster so that
+# locally-built images can be pulled by the kubelet without auth.
+# Reference: https://kind.sigs.k8s.io/docs/user/local-registry/
+containerdConfigPatches:
+  - |
+    [plugins."io.containerd.grpc.v1.cri".registry.mirrors."localhost:5001"]
+      endpoint = ["http://kind-registry:5000"]
+
+# Networking: the default CNI is kindnet, which is sufficient for the
+# capstone. We do not need a custom CNI. The pod and service CIDRs
+# below are the kind defaults; they are pinned to make the manifest
+# self-documenting.
+networking:
+  podSubnet: "10.244.0.0/16"
+  serviceSubnet: "10.96.0.0/12"

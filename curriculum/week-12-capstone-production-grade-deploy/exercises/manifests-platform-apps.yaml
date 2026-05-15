@@ -1,0 +1,503 @@
+# gitops/apps/platform/*.yaml — the platform-component Applications.
+#
+# Each Application installs one platform component via a Helm chart.
+# ArgoCD applies them in sync-wave order (annotation
+# argocd.argoproj.io/sync-wave). Lower numbers apply first; higher
+# numbers wait for lower numbers to be Healthy.
+#
+# Sync waves used in the capstone:
+#   0  — namespaces, CRDs
+#   5  — ingress-nginx, cert-manager (parallel)
+#   10 — kube-prometheus-stack
+#   12 — Loki + Promtail
+#   14 — OpenTelemetry Collector
+#   15 — Vault
+#   16 — Kyverno
+#   17 — Kyverno policies (depend on Kyverno)
+#   20 — OpenCost (depends on Prometheus)
+#   30 — the application (in gitops/apps/app/, not here)
+#
+# Reference:
+#   https://argo-cd.readthedocs.io/en/stable/user-guide/sync-waves/
+# API version: argoproj.io/v1alpha1 (stable since ArgoCD 2.x).
+
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: ingress-nginx
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "5"
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://kubernetes.github.io/ingress-nginx
+    chart: ingress-nginx
+    # Pin to a known-good version. Update deliberately; do not chase
+    # latest. Bump with a PR that has tested values.
+    targetRevision: 4.11.2
+    helm:
+      values: |
+        controller:
+          ingressClassResource:
+            default: true
+          service:
+            # On the kind path we expose via hostPort, not LoadBalancer.
+            type: NodePort
+          # Node selector ties the ingress pod to the control-plane
+          # node which has the ingress-ready=true label from
+          # kind-w12.yaml; this matches the host-port mapping.
+          nodeSelector:
+            ingress-ready: "true"
+          tolerations:
+            - key: node-role.kubernetes.io/control-plane
+              operator: Exists
+              effect: NoSchedule
+          hostPort:
+            enabled: true
+            ports:
+              http: 80
+              https: 443
+          # Allow snippets in Ingress annotations for the capstone.
+          # In a real cluster, this is a security trade-off; the
+          # default in 4.x is false. We enable it for the rate-limiting
+          # demonstration in Exercise 5.
+          allowSnippetAnnotations: true
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: ingress-nginx
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: cert-manager
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "5"
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://charts.jetstack.io
+    chart: cert-manager
+    targetRevision: v1.15.3
+    helm:
+      values: |
+        # CRDs are installed by the chart with this flag; the
+        # alternative is to install them as a separate Application
+        # with sync-wave 0. For the capstone we keep them together.
+        crds:
+          enabled: true
+          keep: true
+        # Resource requests are small; cert-manager is a low-traffic
+        # controller.
+        resources:
+          requests:
+            cpu: 50m
+            memory: 64Mi
+        webhook:
+          resources:
+            requests:
+              cpu: 20m
+              memory: 32Mi
+        cainjector:
+          resources:
+            requests:
+              cpu: 20m
+              memory: 64Mi
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: cert-manager
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+
+---
+# ClusterIssuer for the local self-signed CA. cert-manager mints
+# certificates whose `issuerRef` matches this name. For the cloud
+# path, replace with an ACME issuer pointing at Let's Encrypt.
+#
+# This object is included in the same Application as cert-manager;
+# ArgoCD applies it after the cert-manager CRDs are registered
+# because Kubernetes will refuse a ClusterIssuer until the CRD exists.
+# This relies on the CRDs being created within the same Application's
+# sync wave; the chart handles it.
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: selfsigned-issuer
+  annotations:
+    argocd.argoproj.io/sync-wave: "6"
+spec:
+  selfSigned: {}
+
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: kube-prometheus-stack
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "10"
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://prometheus-community.github.io/helm-charts
+    chart: kube-prometheus-stack
+    targetRevision: 65.0.0
+    helm:
+      values: |
+        prometheus:
+          prometheusSpec:
+            retention: 15d
+            resources:
+              requests:
+                memory: 400Mi
+                cpu: 100m
+            # serviceMonitorSelector empty means "match every
+            # ServiceMonitor in the cluster regardless of labels".
+            # The default in the chart is restrictive; we open it
+            # because the capstone has ServiceMonitors in multiple
+            # namespaces.
+            serviceMonitorSelectorNilUsesHelmValues: false
+            podMonitorSelectorNilUsesHelmValues: false
+            ruleSelectorNilUsesHelmValues: false
+            probeSelectorNilUsesHelmValues: false
+        grafana:
+          adminPassword: "capstone-admin-rotate-in-production"
+          # Provision dashboards from the observability/ directory of
+          # this repo. The sidecar reads ConfigMaps with a specific
+          # label and creates dashboards from them; we apply those
+          # ConfigMaps separately via Kustomize.
+          sidecar:
+            dashboards:
+              enabled: true
+              label: grafana_dashboard
+            datasources:
+              enabled: true
+              label: grafana_datasource
+        alertmanager:
+          # Disabled for the capstone — we define alerts but do not
+          # route them. A real cluster would integrate with Slack
+          # or PagerDuty; the capstone documents this as a gap.
+          enabled: false
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: monitoring
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true  # Required by the chart's large CRDs.
+
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: loki
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "12"
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://grafana.github.io/helm-charts
+    chart: loki
+    targetRevision: 6.16.0
+    helm:
+      values: |
+        # Single-binary mode is appropriate for the kind cluster.
+        # The microservices and SimpleScalable modes are for
+        # production multi-tenant deployments.
+        deploymentMode: SingleBinary
+        loki:
+          auth_enabled: false
+          # Local filesystem storage. For the cloud path, use S3 or GCS.
+          storage:
+            type: filesystem
+          commonConfig:
+            replication_factor: 1
+          schemaConfig:
+            configs:
+              - from: "2024-01-01"
+                store: tsdb
+                object_store: filesystem
+                schema: v13
+                index:
+                  prefix: loki_index_
+                  period: 24h
+        singleBinary:
+          replicas: 1
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+        # Disable the gateway and the read/write components in single
+        # binary mode; they are not used.
+        gateway:
+          enabled: false
+        read:
+          replicas: 0
+        write:
+          replicas: 0
+        backend:
+          replicas: 0
+        # Promtail ships separately; the capstone uses the
+        # grafana/promtail chart for the DaemonSet.
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: monitoring
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: otel-collector
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "14"
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://open-telemetry.github.io/opentelemetry-helm-charts
+    chart: opentelemetry-collector
+    targetRevision: 0.105.0
+    helm:
+      values: |
+        mode: deployment
+        image:
+          repository: otel/opentelemetry-collector-contrib
+        config:
+          receivers:
+            otlp:
+              protocols:
+                grpc:
+                  endpoint: 0.0.0.0:4317
+                http:
+                  endpoint: 0.0.0.0:4318
+          processors:
+            batch:
+              timeout: 10s
+              send_batch_size: 1024
+          exporters:
+            # For the capstone, we log traces to stdout. A real
+            # cluster would send to Tempo or Jaeger; the capstone
+            # documents this as a stretch goal.
+            debug:
+              verbosity: basic
+          service:
+            pipelines:
+              traces:
+                receivers: [otlp]
+                processors: [batch]
+                exporters: [debug]
+              metrics:
+                receivers: [otlp]
+                processors: [batch]
+                exporters: [debug]
+              logs:
+                receivers: [otlp]
+                processors: [batch]
+                exporters: [debug]
+        resources:
+          requests:
+            cpu: 50m
+            memory: 128Mi
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: monitoring
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: vault
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "15"
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://helm.releases.hashicorp.com
+    chart: vault
+    targetRevision: 0.28.1
+    helm:
+      values: |
+        server:
+          # Dev mode for the kind cluster. The root token is
+          # well-known ("root") and the server is unsealed
+          # automatically on start. For the cloud path, this must
+          # be replaced with HA mode and an external unsealer.
+          dev:
+            enabled: true
+            devRootToken: "root"
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+        injector:
+          enabled: true
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: vault
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: kyverno
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "16"
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://kyverno.github.io/kyverno/
+    chart: kyverno
+    targetRevision: 3.3.0
+    helm:
+      values: |
+        admissionController:
+          replicas: 1
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+        backgroundController:
+          replicas: 1
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+        cleanupController:
+          replicas: 1
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+        reportsController:
+          replicas: 1
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: kyverno
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: opencost
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "20"
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://opencost.github.io/opencost-helm-chart
+    chart: opencost
+    targetRevision: 1.45.0
+    helm:
+      values: |
+        opencost:
+          prometheus:
+            internal:
+              enabled: true
+              serviceName: kube-prometheus-stack-prometheus
+              namespaceName: monitoring
+              port: 9090
+          # Local rate card approximating AWS us-east-1 m6i pricing.
+          # OpenCost uses this when no cloud provider integration is
+          # configured. Reference:
+          # https://github.com/opencost/opencost/blob/develop/docs/custom-pricing.md
+          customPricing:
+            enabled: true
+            costModel:
+              description: "Local kind rate card; approximate AWS m6i pricing"
+              CPU: "0.031611"
+              spotCPU: "0.006655"
+              RAM: "0.004237"
+              spotRAM: "0.000892"
+              GPU: "0.95"
+              storage: "0.00005479"
+              zoneNetworkEgress: "0.01"
+              regionNetworkEgress: "0.01"
+              internetNetworkEgress: "0.143"
+          resources:
+            requests:
+              cpu: 50m
+              memory: 256Mi
+        ui:
+          enabled: true
+          resources:
+            requests:
+              cpu: 20m
+              memory: 64Mi
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: opencost
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
