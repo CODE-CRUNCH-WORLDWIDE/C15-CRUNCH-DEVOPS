@@ -1,0 +1,85 @@
+---
+# Kyverno ClusterPolicy: refuse any Pod or Deployment in a namespace whose
+# environment label is "production" if the Pod template does not carry the
+# four required cost-allocation labels.
+#
+# Apply with:
+#   kubectl apply -f manifests-kyverno-cost-labels.yaml
+#
+# Prerequisites: Kyverno installed (see exercise-02 setup).
+#
+# Reference: https://kyverno.io/docs/writing-policies/
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-cost-labels
+  annotations:
+    policies.kyverno.io/title: "Require cost-allocation labels on production workloads"
+    policies.kyverno.io/category: "FinOps / Cost Governance"
+    policies.kyverno.io/severity: "medium"
+    policies.kyverno.io/subject: "Pod, Deployment"
+    policies.kyverno.io/description: >-
+      All Pods in namespaces labeled environment=production must carry the
+      labels: team, cost-center, environment, owner. Without these, OpenCost
+      cannot attribute the pod's cost to a team or cost center.
+spec:
+  validationFailureAction: Enforce
+  background: true
+  rules:
+    - name: check-required-cost-labels
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+              namespaceSelector:
+                matchLabels:
+                  environment: production
+      validate:
+        message: >-
+          Production pods must carry labels: team, cost-center, environment,
+          owner. See team standard for cost allocation.
+        pattern:
+          metadata:
+            labels:
+              team: "?*"
+              cost-center: "?*"
+              environment: "?*"
+              owner: "?*"
+---
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-cost-labels-on-deployments
+  annotations:
+    policies.kyverno.io/title: "Require cost-allocation labels on Deployments (production)"
+    policies.kyverno.io/category: "FinOps / Cost Governance"
+spec:
+  validationFailureAction: Enforce
+  background: true
+  rules:
+    - name: check-required-cost-labels-on-deployment
+      match:
+        any:
+          - resources:
+              kinds:
+                - Deployment
+                - StatefulSet
+                - DaemonSet
+              namespaceSelector:
+                matchLabels:
+                  environment: production
+      validate:
+        message: >-
+          Production Deployments/StatefulSets/DaemonSets must carry labels:
+          team, cost-center, environment, owner, on both the controller
+          metadata and the pod template metadata.
+        pattern:
+          spec:
+            template:
+              metadata:
+                labels:
+                  team: "?*"
+                  cost-center: "?*"
+                  environment: "?*"
+                  owner: "?*"

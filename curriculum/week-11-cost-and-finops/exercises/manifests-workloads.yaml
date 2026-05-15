@@ -1,0 +1,187 @@
+---
+# Three deliberately mis-sized workloads, in three namespaces, with labels
+# we will use for cost allocation. Apply with:
+#   kubectl apply -f manifests-workloads.yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: team-platform
+  labels:
+    team: platform
+    cost-center: cc-1001
+    environment: production
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: team-payments
+  labels:
+    team: payments
+    cost-center: cc-1002
+    environment: production
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: team-analytics
+  labels:
+    team: analytics
+    cost-center: cc-1003
+    environment: staging
+---
+# Over-provisioned: this Deployment requests far more than it uses.
+# It will appear in OpenCost with a low cpuEfficiency / ramEfficiency.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ratings-api
+  namespace: team-platform
+  labels:
+    app: ratings-api
+    team: platform
+    cost-center: cc-1001
+    environment: production
+    owner: sre-platform
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: ratings-api
+  template:
+    metadata:
+      labels:
+        app: ratings-api
+        team: platform
+        cost-center: cc-1001
+        environment: production
+        owner: sre-platform
+    spec:
+      containers:
+        - name: app
+          image: nginx:1.27.0
+          ports:
+            - containerPort: 80
+          resources:
+            requests:
+              cpu: "800m"
+              memory: "1Gi"
+            limits:
+              cpu: "1500m"
+              memory: "2Gi"
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 80
+            initialDelaySeconds: 3
+            periodSeconds: 5
+---
+# Right-sized: this Deployment's requests roughly match its usage.
+# It will appear in OpenCost with high efficiency.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: checkout-api
+  namespace: team-payments
+  labels:
+    app: checkout-api
+    team: payments
+    cost-center: cc-1002
+    environment: production
+    owner: sre-payments
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: checkout-api
+  template:
+    metadata:
+      labels:
+        app: checkout-api
+        team: payments
+        cost-center: cc-1002
+        environment: production
+        owner: sre-payments
+    spec:
+      containers:
+        - name: app
+          image: nginx:1.27.0
+          ports:
+            - containerPort: 80
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "200m"
+              memory: "128Mi"
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 80
+            initialDelaySeconds: 3
+            periodSeconds: 5
+---
+# Idle staging: this Deployment has 4 replicas but receives no traffic.
+# In a real cluster this is a staging environment left on overnight.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: report-generator
+  namespace: team-analytics
+  labels:
+    app: report-generator
+    team: analytics
+    cost-center: cc-1003
+    environment: staging
+    owner: sre-analytics
+spec:
+  replicas: 4
+  selector:
+    matchLabels:
+      app: report-generator
+  template:
+    metadata:
+      labels:
+        app: report-generator
+        team: analytics
+        cost-center: cc-1003
+        environment: staging
+        owner: sre-analytics
+    spec:
+      containers:
+        - name: app
+          image: busybox:1.36
+          command: ["/bin/sh", "-c", "while true; do sleep 60; done"]
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+---
+# A pod deliberately missing the required labels.
+# The Kyverno policy in manifests-kyverno-cost-labels.yaml will refuse it.
+# Apply this manifest separately to observe the rejection.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: unlabeled-app
+  namespace: team-platform
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: unlabeled-app
+  template:
+    metadata:
+      labels:
+        app: unlabeled-app
+    spec:
+      containers:
+        - name: app
+          image: nginx:1.27.0
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"

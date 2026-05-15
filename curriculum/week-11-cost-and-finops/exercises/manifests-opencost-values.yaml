@@ -1,0 +1,94 @@
+# Helm values for the opencost-helm-chart at:
+#   https://github.com/opencost/opencost-helm-chart
+#
+# Applied with:
+#   helm install opencost opencost/opencost \
+#     --namespace opencost --create-namespace \
+#     --values manifests-opencost-values.yaml
+#
+# Pin the chart version in CI; tested with chart 1.45.x against opencost
+# 1.115.x. Newer chart versions move keys around occasionally; consult the
+# upstream values.yaml if a key here is rejected on install.
+
+opencost:
+  exporter:
+    image:
+      registry: ghcr.io
+      repository: opencost/opencost
+      tag: "1.115.0"
+    defaultClusterId: "w11"
+    resources:
+      requests:
+        cpu: 50m
+        memory: 128Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
+    cloudIntegrationSecret: ""
+    extraEnv:
+      - name: LOG_LEVEL
+        value: "info"
+
+  prometheus:
+    internal:
+      enabled: true
+      namespaceName: "monitoring"
+      serviceName: "prometheus-kube-prometheus-prometheus"
+      port: 9090
+    external:
+      enabled: false
+
+  ui:
+    enabled: true
+    image:
+      registry: ghcr.io
+      repository: opencost/opencost-ui
+      tag: "1.115.0"
+    resources:
+      requests:
+        cpu: 10m
+        memory: 64Mi
+      limits:
+        cpu: 200m
+        memory: 256Mi
+
+  customPricing:
+    enabled: true
+    configmapName: opencost-custom-pricing
+    createConfigmap: true
+    # See: https://github.com/opencost/opencost/blob/develop/docs/custom-pricing.md
+    # Rates approximate AWS us-east-1 m6i pricing as of May 2026.
+    # CPU/RAM are per core-hour and per GB-hour, NOT per node-hour.
+    provider: "custom"
+    description: "Custom rate card for w11 kind cluster (approx AWS us-east-1 m6i)."
+    CPU: "0.031611"
+    RAM: "0.004237"
+    GPU: "0.95"
+    storage: "0.00005479"
+    zoneNetworkEgress: "0.01"
+    regionNetworkEgress: "0.01"
+    internetNetworkEgress: "0.09"
+    spotCPU: "0.006655"
+    spotRAM: "0.000892"
+
+service:
+  type: ClusterIP
+  port: 9003
+  uiPort: 9090
+
+serviceAccount:
+  create: true
+  name: opencost
+
+rbac:
+  enabled: true
+
+networkPolicies:
+  enabled: false
+
+extraVolumeMounts: []
+extraVolumes: []
+
+# We do NOT set a Pod-level priorityClass here; on a kind cluster with no
+# PriorityClass installed the install would fail. In production, pin to
+# `system-cluster-critical` or a custom PriorityClass.
